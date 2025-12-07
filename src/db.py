@@ -1,4 +1,3 @@
-# db.py
 import os
 import psycopg
 from contextlib import contextmanager
@@ -37,9 +36,6 @@ def get_cursor():
 
 
 def run_query(sql, params=None):
-  """
-  Run arbitrary SQL and return (colnames, rows).
-  """
   with get_cursor() as cur:
     cur.execute(sql, params or ())
     rows = cur.fetchall()
@@ -48,10 +44,6 @@ def run_query(sql, params=None):
 
 
 def run_scalar(sql, params=None):
-  """
-  Run a query expected to return a single scalar value.
-  E.g., SUM(...) or COUNT(*).
-  """
   with get_cursor() as cur:
     cur.execute(sql, params or ())
     value = cur.fetchone()[0]

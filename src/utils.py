@@ -1,4 +1,3 @@
-# utils.py
 from tabulate import tabulate
 
 def print_table(colnames, rows, title=None, max_rows=20):
