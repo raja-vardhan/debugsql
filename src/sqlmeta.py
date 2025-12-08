@@ -140,3 +140,22 @@ class QueryProfile:
     if isinstance(expr, exp.And):
       return self._split_conjuncts(expr.left) + self._split_conjuncts(expr.right)
     return [expr]
+  
+  def _reconstruct_from_join_clause(self, parsed: exp.Select) -> str:
+    from_expr = parsed.args.get("from")
+    if from_expr is None:
+        raise ValueError("Query has no FROM clause.")
+
+    sql = "FROM "
+
+    # FROM table or subquery
+    sql += from_expr.sql(dialect="postgres")
+
+    # Handle JOINs (sqlglot stores them in .joins)
+    joins = from_expr.args.get("joins", [])
+    for j in joins:
+        join_sql = j.sql(dialect="postgres")
+        sql += "\n" + join_sql
+
+    return sql
+
