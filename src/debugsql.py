@@ -19,10 +19,13 @@ def main():
 
     # Aggregate subparser
     agg_parser = subparsers.add_parser("agg", parents=[common], help="Analyze aggregate contributions")
-    
+    agg_parser.add_argument("--expected-sum", type=float)
+    agg_parser.add_argument("--expected-count", type=float)
+    agg_parser.add_argument("--expected-avg", type=float)
 
     # Join subparser
     join_parser = subparsers.add_parser("join", parents=[common], help="Analyze join key mismatches")
+    join_parser.add_argument("--expected-count", type=float)
 
     # Predicate analysis subparser
     predicate_parser = subparsers.add_parser("predicate", parents=[common], help="Analyze predicates")
@@ -44,14 +47,18 @@ def main():
 
     if args.cmd == "agg":
         qp = QueryProfile(args.query)
-        analyzer = AggregateAnalyzer(qp)
+        analyzer = AggregateAnalyzer(
+            qp,
+            expected_sum=args.expected_sum,
+            expected_count=args.expected_count,
+            expected_avg=args.expected_avg)
         print("\n==============================")
         print(f"Running {analyzer.__class__.__name__}")
         print("==============================\n")
         analyzer.analyze()
     elif args.cmd == "join":
         qp = QueryProfile(args.query)
-        analyzer = JoinAnalyzer(qp)
+        analyzer = JoinAnalyzer(qp, expected_count=args.expected_count)
         print("\n==============================")
         print(f"Running {analyzer.__class__.__name__}")
         print("==============================\n")

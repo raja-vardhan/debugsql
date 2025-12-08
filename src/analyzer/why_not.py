@@ -20,7 +20,8 @@ class WhyNotAnalyzer(Analyzer):
     def analyze(self):
         expl = self._analyze_why_not()
         expl.render_explanation(mode=self.output)
-    
+
+
     def _get_base_row(self, pred: str):
         sql = f"""
             SELECT *
@@ -37,6 +38,9 @@ class WhyNotAnalyzer(Analyzer):
             if t.name.lower() == self.table.lower():
                 return t.alias_or_name
         return None
+
+    def _alias_to_table(self, alias: str) -> str:
+        return self.qp.tables.get(alias, alias)
 
     def _extract_where_conjuncts(self, where_expr):
         if where_expr is None:
@@ -79,7 +83,7 @@ class WhyNotAnalyzer(Analyzer):
         return aliases
 
     def _group_where_by_alias(self, parsed: exp.Select) -> Dict[str, List[exp.Expression]]:
-        alias_to_preds = {}
+        alias_to_preds: Dict[str, List[exp.Expression]] = {}
         where_expr = parsed.args.get("where")
         if where_expr is None:
             return alias_to_preds
@@ -176,9 +180,183 @@ class WhyNotAnalyzer(Analyzer):
 
         return failures
 
+    def _strip_alias_from_key_predicate(self, key_predicate: str, base_alias: str) -> str:
+        if base_alias and key_predicate.strip().startswith(base_alias + "."):
+            return key_predicate.split(".", 1)[1]
+        return key_predicate
+
+    def _compute_minimal_subset(self, failing_base, join_failures):
+        causes = []
+
+        for fb in failing_base:
+            causes.append({
+                "type": "predicate_failure",
+                "predicate": fb["sql"],
+                "expr": fb["expr"],
+                "reason": f"Base-table predicate `{fb['sql']}` is FALSE for this tuple."
+            })
+
+        alias_groups: Dict[str, List[Dict[str, Any]]] = {}
+        for jf in join_failures:
+            alias_groups.setdefault(jf["alias"], []).append(jf)
+
+        for alias, failures in alias_groups.items():
+            if len(failures) == 1:
+                jf = failures[0]
+                causes.append({
+                    "type": "join_failure",
+                    "alias": alias,
+                    "predicate": jf["predicate"],
+                    "reason": jf["reason"],
+                    "actual_values": jf.get("actual_values", []),
+                })
+            else:
+                preds = [f["predicate"] for f in failures if f["predicate"]]
+               
+                causes.append({
+                    "type": "join_failure_group",
+                    "alias": alias,
+                    "predicates": preds,
+                    "reason": f"Alias `{alias}` has multiple blocking join conditions.",
+                    "actual_values": [f.get("actual_values", []) for f in failures],
+                })
+
+        n = len(causes)
+        if n > 0:
+            for c in causes:
+                c["responsibility"] = 1.0 / n
+
+        return causes
+
+    def _describe_predicate_repair(self, expr: exp.Expression, sql_str: str,
+                                   base_row_dict: Dict[str, Any]) -> str:
+        suggestion = (
+            f"Relax or modify predicate `{sql_str}` so it becomes TRUE "
+            "for the base tuple."
+        )
+
+        simple_ops = (exp.GT, exp.GTE, exp.LT, exp.LTE, exp.EQ, exp.NEQ)
+        if not isinstance(expr, simple_ops):
+            return suggestion
+
+        left, right = expr.left, expr.right
+        col_node = None
+        lit_node = None
+        flipped = False
+
+        if isinstance(left, exp.Column) and isinstance(right, exp.Literal):
+            col_node = left
+            lit_node = right
+        elif isinstance(right, exp.Column) and isinstance(left, exp.Literal):
+            col_node = right
+            lit_node = left
+            flipped = True
+
+        if col_node is None or lit_node is None:
+            return suggestion
+
+        col_name = col_node.name
+        literal_val = lit_node.this
+
+        if col_name not in base_row_dict:
+            return suggestion
+
+        actual_val = base_row_dict[col_name]
+
+        try:
+            actual_num = float(actual_val)
+            lit_num = float(literal_val)
+        except Exception:
+            return suggestion
+
+        op = type(expr)
+
+        if op is exp.GT and not flipped:
+            suggestion += (
+                f" For example, decrease the threshold from {lit_num} down to "
+                f"{actual_num} or smaller, or increase `{col_name}` above {lit_num}."
+            )
+        elif op is exp.GTE and not flipped:
+            suggestion += (
+                f" For example, decrease the threshold from {lit_num} down to "
+                f"{actual_num} or smaller, or increase `{col_name}` to at least {lit_num}."
+            )
+        elif op is exp.LT and not flipped:
+            suggestion += (
+                f" For example, increase the threshold from {lit_num} up to "
+                f"{actual_num} or larger, or decrease `{col_name}` below {lit_num}."
+            )
+        elif op is exp.LTE and not flipped:
+            suggestion += (
+                f" For example, increase the threshold from {lit_num} up to "
+                f"{actual_num} or larger, or decrease `{col_name}` to at most {lit_num}."
+            )
+        else:
+            suggestion += (
+                f" (Current value of `{col_name}` is {actual_val} vs literal {literal_val}.)"
+            )
+
+        return suggestion
+
+    def _build_repair_suggestions(
+        self,
+        minimal_subset: List[Dict[str, Any]],
+        base_row_info: Optional[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        
+        suggestions = []
+
+        base_row_dict: Dict[str, Any] = {}
+        if base_row_info and "columns" in base_row_info and "row" in base_row_info:
+            base_row_dict = dict(zip(base_row_info["columns"], base_row_info["row"]))
+
+        for cause in minimal_subset:
+            ctype = cause["type"]
+
+            if ctype == "predicate_failure":
+                expr = cause.get("expr")
+                pred_sql = cause["predicate"]
+                text = self._describe_predicate_repair(expr, pred_sql, base_row_dict)
+                suggestions.append({
+                    "type": "predicate_repair",
+                    "predicate": pred_sql,
+                    "cause": cause,
+                    "suggestion": text,
+                })
+
+            elif ctype in ("join_failure", "join_failure_group"):
+                alias = cause["alias"]
+                table_name = self._alias_to_table(alias)
+                preds = cause.get("predicates") or ([cause["predicate"]]
+                                                    if cause.get("predicate") else [])
+                preds_str = ", ".join(f"`{p}`" for p in preds if p)
+
+                if cause.get("actual_values"):
+                    text = (
+                        f"Ensure there is at least one row in table `{table_name}` "
+                        f"(alias `{alias}`) that matches the base tuple on join keys "
+                        f"and satisfies all join-side predicates {preds_str or '(none)'}."
+                    )
+                else:
+                    text = (
+                        f"Insert or modify a row in table `{table_name}` (alias `{alias}`) "
+                        "so that it joins with the base tuple (i.e., satisfies the join "
+                        f"condition) and any relevant predicates {preds_str or '(none)'}."
+                    )
+
+                suggestions.append({
+                    "type": "join_repair",
+                    "alias": alias,
+                    "table": table_name,
+                    "cause": cause,
+                    "suggestion": text,
+                })
+
+        return suggestions
+
     def _analyze_why_not(self) -> Explanation:
-        bullets = []
-        details = {}
+        bullets: List[str] = []
+        details: Dict[str, Any] = {}
 
         parsed = self._parse_query()
         base_alias = self._find_base_alias(parsed)
@@ -198,7 +376,7 @@ class WhyNotAnalyzer(Analyzer):
             )
 
         details["base_row"] = {"columns": base_cols, "row": base_rows[0]}
-        bullets.append("The base tuple exists.")
+        bullets.append("The base tuple exists in the underlying table.")
 
         parsed = self._parse_query()
         base_alias = self._find_base_alias(parsed)
@@ -214,23 +392,27 @@ class WhyNotAnalyzer(Analyzer):
             )
 
         where_expr = parsed.args.get("where")
-        conjuncts = self._extract_where_conjuncts(where_expr.this) if where_expr is not None else []
-        failing_base = []
+        conjuncts = (
+            self._extract_where_conjuncts(where_expr.this)
+            if where_expr is not None
+            else []
+        )
+        failing_base: List[Dict[str, Any]] = []
 
         for conj in conjuncts:
             if self._expr_uses_only_alias(conj, base_alias):
                 pred_sql = conj.sql(dialect="postgres")
                 ok = self._eval_predicate_on_base(base_alias, pred_sql)
                 if ok is False:
-                    failing_base.append(pred_sql)
+                    failing_base.append({"sql": pred_sql, "expr": conj})
 
         if failing_base:
             bullets.append("Base-table predicate failures:")
-            for p in failing_base:
-                bullets.append(f"  • `{p}` is FALSE for this tuple.")
-            details["failing_base_predicates"] = failing_base
+            for fb in failing_base:
+                bullets.append(f"  • `{fb['sql']}` is FALSE for this tuple.")
+            details["failing_base_predicates"] = [fb["sql"] for fb in failing_base]
         else:
-            bullets.append("All base-table predicates are satisfied.")
+            bullets.append("All base-table predicates on the base tuple are satisfied.")
 
         join_failures = self._analyze_join_failures(parsed, base_alias)
 
@@ -246,20 +428,50 @@ class WhyNotAnalyzer(Analyzer):
                         f"  • Alias `{jf['alias']}` has no matching joined rows."
                     )
             details["join_failures"] = join_failures
-
         else:
             bullets.append(
                 "No join-based failures detected. If the tuple is still absent, grouping or HAVING may be responsible."
             )
+
+        minimal_subset = self._compute_minimal_subset(failing_base, join_failures)
+        details["minimal_subset"] = minimal_subset
+
+        if minimal_subset:
+            bullets.append("Minimal subset of causes preventing this tuple from appearing:")
+            for m in minimal_subset:
+                if m["type"] == "predicate_failure":
+                    bullets.append(
+                        f"  • Base-table predicate `{m['predicate']}` fails "
+                        f"(responsibility ≈ {m['responsibility']:.2f})."
+                    )
+                elif m["type"] == "join_failure":
+                    bullets.append(
+                        f"  • Join alias `{m['alias']}` with blocking predicate "
+                        f"`{m['predicate']}` (responsibility ≈ {m['responsibility']:.2f})."
+                    )
+                elif m["type"] == "join_failure_group":
+                    preds = ", ".join(m["predicates"]) if m["predicates"] else "(no predicates)"
+                    bullets.append(
+                        f"  • Join alias `{m['alias']}` with multiple blocking "
+                        f"conditions: {preds} (responsibility ≈ {m['responsibility']:.2f})."
+                    )
+        else:
+            bullets.append(
+                "No explicit blocking predicates or joins were found; the tuple may be excluded by grouping, HAVING, or DISTINCT."
+            )
+
+        repair_suggestions = self._build_repair_suggestions(
+            minimal_subset, details.get("base_row")
+        )
+        details["repair_suggestions"] = repair_suggestions
+
+        if repair_suggestions:
+            bullets.append("Possible repairs (hypothetical changes that would allow the tuple to appear):")
+            for r in repair_suggestions:
+                bullets.append(f"  • {r['suggestion']}")
 
         return Explanation(
             title=f"Why is tuple `{self.key_predicate}` missing?",
             bullets=bullets,
             details=details,
         )
-    
-    def _strip_alias_from_key_predicate(self, key_predicate: str, base_alias: str) -> str:
-        if key_predicate.strip().startswith(base_alias + "."):
-            return key_predicate.split(".", 1)[1]
-        return key_predicate
-
