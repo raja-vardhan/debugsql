@@ -1,4 +1,3 @@
-````markdown
 # DebugSQL  
 A command-line tool for explaining unexpected SQL query results.
 
@@ -41,7 +40,7 @@ DebugSQL draws inspiration from prior work such as DataPrism, Why-Not provenance
 git clone <your-repo-url>
 cd debugsql
 pip install -r requirements.txt
-````
+```
 
 Configure PostgreSQL credentials in `src/db.py`.
 
