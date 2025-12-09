@@ -1,5 +1,6 @@
 import argparse
 import utils
+import time
 from sqlmeta import QueryProfile
 from analyzer.aggregate import AggregateAnalyzer
 from analyzer.join import JoinAnalyzer
@@ -9,7 +10,12 @@ from analyzer.expected import ExpectedResultAnalyzer
 from analyzer.why_not import WhyNotAnalyzer
 from db import run_query
 
+def report_time(t_start):
+    elapsed = (time.perf_counter() - t_start) * 1000
+    print(f"\n[DebugSQL] Execution time: {elapsed:.2f} ms\n")
+
 def main():
+
     parser = argparse.ArgumentParser(description="DebugSQL")
     subparsers = parser.add_subparsers(dest="cmd")
 
@@ -44,6 +50,8 @@ def main():
 
 
     args = parser.parse_args()
+
+    t0 = time.perf_counter()
 
     if args.cmd == "agg":
         qp = QueryProfile(args.query)
@@ -86,6 +94,8 @@ def main():
     else:
         cols, rows = run_query(args.query)
         utils.print_table(cols, rows)
+
+    report_time(t0)
 
 if __name__ == "__main__":
     main()
